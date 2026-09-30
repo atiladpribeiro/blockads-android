@@ -1,7 +1,6 @@
 package app.pwhs.blockads.service.vpn
 
 import android.content.Context
-import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.os.ParcelFileDescriptor
 import app.pwhs.blockads.data.dao.FirewallRuleDao
@@ -10,6 +9,7 @@ import app.pwhs.blockads.data.entities.DnsProtocol
 import app.pwhs.blockads.data.repository.FilterListRepository
 import app.pwhs.blockads.service.FirewallManager
 import app.pwhs.blockads.service.GoTunnelAdapter
+import app.pwhs.blockads.service.SystemDnsServers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -89,24 +89,21 @@ class VpnEngineCoordinator(
     suspend fun configureEngine(goTunnelAdapter: GoTunnelAdapter, config: StartupConfig) {
         var finalUpstreamDns = config.upstreamDns
         var finalDnsProtocol = config.dnsProtocol.name
+        var finalFallbackDns = config.fallbackDns
 
         if (config.dnsProviderId == "system") {
-            val systemDnsList = getSystemDnsServers(context)
-            if (systemDnsList.isNotEmpty()) {
-                finalUpstreamDns = systemDnsList.first()
-                Timber.d("System DNS resolved to: $finalUpstreamDns")
-            } else {
-                finalUpstreamDns = "8.8.8.8"
-                Timber.d("System DNS empty, falling back to 8.8.8.8")
-            }
+            val systemDnsList = SystemDnsServers.current(context)
+            require(systemDnsList.isNotEmpty()) { "No DNS server supplied by the current network" }
+            finalUpstreamDns = systemDnsList.first()
+            finalFallbackDns = systemDnsList.drop(1).firstOrNull() ?: ""
             finalDnsProtocol = "PLAIN"
         }
 
         goTunnelAdapter.configureDns(
             protocol = finalDnsProtocol,
             primary = finalUpstreamDns,
-            fallback = config.fallbackDns,
-            dohUrl = config.dohUrl
+            fallback = finalFallbackDns,
+            dohUrl = if (config.dnsProviderId == "system") "" else config.dohUrl
         )
         goTunnelAdapter.setBlockResponseType(config.dnsResponseType)
         goTunnelAdapter.configureSafeSearch(config.safeSearchEnabled, config.youtubeRestrictedMode)
@@ -152,17 +149,16 @@ class VpnEngineCoordinator(
     ) {
         val providerId = appPrefs.dnsProviderId.first()
         if (providerId == "system") {
-            val newDns = linkProperties?.dnsServers?.mapNotNull { it.hostAddress }
-                ?.filter { it.isNotEmpty() } ?: emptyList()
-            val primary = newDns.firstOrNull() ?: "8.8.8.8"
+            val newDns = SystemDnsServers.current(context)
+            if (newDns.isEmpty()) return
+            val primary = newDns.first()
             Timber.d("Network LinkProperties changed, hot-reloading System DNS: $primary")
-            val fallback = appPrefs.fallbackDns.first()
-            val dohUrl = appPrefs.dohUrl.first()
+            val fallback = newDns.drop(1).firstOrNull() ?: ""
             goTunnelAdapter.configureDns(
                 protocol = "PLAIN",
                 primary = primary,
                 fallback = fallback,
-                dohUrl = dohUrl
+                dohUrl = ""
             )
         }
     }
@@ -176,11 +172,4 @@ class VpnEngineCoordinator(
         }
     }
 
-    private fun getSystemDnsServers(context: Context): List<String> {
-        val connectivityManager =
-            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-        val activeNetwork = connectivityManager?.activeNetwork ?: return emptyList()
-        val linkProperties = connectivityManager.getLinkProperties(activeNetwork) ?: return emptyList()
-        return linkProperties.dnsServers.mapNotNull { it.hostAddress }.filter { it.isNotEmpty() }
-    }
 }

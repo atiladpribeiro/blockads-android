@@ -97,6 +97,8 @@
     <string name="settings_auto_update_notification_silent">Silencioso</string>
     <string name="settings_auto_update_notification_none">Nenhuma</string>
     <string name="dns_provider_title">Servidor DNS</string>
+    <string name="dns_provider_system_default">Padrão do sistema</string>
+    <string name="dns_provider_system_description">Usar os servidores DNS fornecidos pela rede atual</string>
     <string name="dns_category_standard">Padrão</string>
     <string name="dns_category_privacy">Foco em privacidade</string>
     <string name="dns_category_family">Seguro para família</string>

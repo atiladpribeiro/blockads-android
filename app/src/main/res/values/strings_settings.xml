@@ -133,6 +133,8 @@
     <string name="settings_auto_update_notification_silent">Silent</string>
     <string name="settings_auto_update_notification_none">None</string>
     <string name="dns_provider_title">DNS Server</string>
+    <string name="dns_provider_system_default">System default</string>
+    <string name="dns_provider_system_description">Use DNS servers supplied by the current network</string>
     <string name="dns_category_standard">Standard</string>
     <string name="dns_category_privacy">Privacy-focused</string>
     <string name="dns_category_family">Family-safe</string>

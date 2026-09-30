@@ -95,6 +95,12 @@ class DnsProviderViewModel(
         viewModelScope.launch {
             appPrefs.setDnsProviderId(provider.id)
             appPrefs.setUpstreamDns(provider.ipAddress)
+            if (provider.id == DnsProviders.SYSTEM.id) {
+                // Network DNS is supplied by Android at runtime. A saved public
+                // fallback would silently override the user's system choice.
+                appPrefs.setFallbackDns("")
+                appPrefs.setDohUrl("")
+            }
 
             // Set protocol based on provider capabilities
             if (provider.dohUrl != null) {
@@ -110,11 +116,10 @@ class DnsProviderViewModel(
 
             // Only auto-set fallback DNS if it would conflict with the new primary
             val currentFallback = appPrefs.fallbackDns.first()
-            if (currentFallback == provider.ipAddress) {
+            if (provider.id != DnsProviders.SYSTEM.id && currentFallback == provider.ipAddress) {
                 val fallbackProvider = when (provider.id) {
                     DnsProviders.QUAD9.id, DnsProviders.QUAD9_DOQ.id -> DnsProviders.ADGUARD
                     DnsProviders.ADGUARD.id -> DnsProviders.QUAD9
-                    DnsProviders.SYSTEM.id -> DnsProviders.QUAD9
                     else -> {
                         DnsProviders.ALL_PROVIDERS.firstOrNull {
                             it.id != provider.id && it.category == DnsCategory.PRIVACY

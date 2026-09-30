@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import androidx.work.OneTimeWorkRequestBuilder
@@ -104,6 +106,9 @@ class RootProxyService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var startupJob: Job? = null
     private var watchdogJob: Job? = null
+    private var systemDnsCallback: ConnectivityManager.NetworkCallback? = null
+    private var systemDnsEnabled = false
+    private var activeSystemDnsServers: List<String> = emptyList()
     private var notificationUpdateJob: Job? = null
     private var retryManager = VpnRetryManager(maxRetries = 10, maxDelayMs = 60000L)
 
@@ -214,11 +219,30 @@ class RootProxyService : Service() {
                 val primary = appPrefs.upstreamDns.first()
                 val fallback = appPrefs.fallbackDns.first()
                 val dohUrl = appPrefs.dohUrl.first()
+                systemDnsEnabled = appPrefs.dnsProviderId.first() == "system"
                 val safeSearch = appPrefs.safeSearchEnabled.first()
                 val youtubeSafe = appPrefs.youtubeRestrictedMode.first()
                 val responseType = appPrefs.dnsResponseType.first()
 
-                goTunnelAdapter.configureDns(protocol, primary, fallback, dohUrl)
+                if (systemDnsEnabled) {
+                    activeSystemDnsServers = SystemDnsServers.current(this@RootProxyService)
+                    if (activeSystemDnsServers.isEmpty()) {
+                        Timber.i("Waiting for a network-provided DNS server")
+                    }
+                    while (isActive && _state.value == VpnState.STARTING && activeSystemDnsServers.isEmpty()) {
+                        delay(10_000)
+                        activeSystemDnsServers = SystemDnsServers.current(this@RootProxyService)
+                    }
+                    if (!isActive || _state.value != VpnState.STARTING) return@launch
+                } else {
+                    activeSystemDnsServers = emptyList()
+                }
+                goTunnelAdapter.configureDns(
+                    if (systemDnsEnabled) "PLAIN" else protocol,
+                    if (systemDnsEnabled) activeSystemDnsServers.first() else primary,
+                    if (systemDnsEnabled) activeSystemDnsServers.drop(1).firstOrNull() ?: "" else fallback,
+                    if (systemDnsEnabled) "" else dohUrl
+                )
                 goTunnelAdapter.configureSafeSearch(safeSearch, youtubeSafe)
                 goTunnelAdapter.setBlockResponseType(responseType)
 
@@ -306,6 +330,7 @@ class RootProxyService : Service() {
                 startNotificationUpdates()
 
                 // 4. Start watchdog
+                if (systemDnsEnabled) registerSystemDnsCallback()
                 startWatchdog()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -326,11 +351,12 @@ class RootProxyService : Service() {
         if (!fromStartupFailure) startupJob?.cancel()
         startupJob = null
         watchdogJob?.cancel()
+        unregisterSystemDnsCallback()
         stopNotificationUpdates()
         appNameResolver.stopSnapshotter()
 
         // Teardown iptables rules (critical — prevents internet loss)
-        IptablesManager.teardownRules(this)
+        synchronized(this) { IptablesManager.teardownRules(this) }
 
         // Stop Go engine
         goTunnelAdapter.stop()
@@ -381,6 +407,7 @@ class RootProxyService : Service() {
         Timber.d("Restarting Root Proxy to apply new settings")
 
         watchdogJob?.cancel()
+        unregisterSystemDnsCallback()
         stopNotificationUpdates()
         appNameResolver.stopSnapshotter()
 
@@ -389,7 +416,9 @@ class RootProxyService : Service() {
             goTunnelAdapter.stop()
 
             // Teardown iptables
-            IptablesManager.teardownRules(this@RootProxyService)
+            synchronized(this@RootProxyService) {
+                IptablesManager.teardownRules(this@RootProxyService)
+            }
 
             // Brief delay to let resources clean up
             delay(1000L)
@@ -398,6 +427,55 @@ class RootProxyService : Service() {
             preserveUptimeOnRestart = true
             _state.value = VpnState.STOPPED
             startProxy()
+        }
+    }
+
+    private fun registerSystemDnsCallback() {
+        val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = queueSystemDnsRefresh()
+            override fun onLost(network: Network) = queueSystemDnsRefresh()
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) =
+                queueSystemDnsRefresh()
+        }
+        try {
+            manager.registerDefaultNetworkCallback(callback)
+            systemDnsCallback = callback
+        } catch (e: Exception) {
+            // The watchdog also refreshes network DNS every ten seconds.
+            Timber.w(e, "Unable to register DNS network callback")
+        }
+    }
+
+    private fun unregisterSystemDnsCallback() {
+        val callback = systemDnsCallback ?: return
+        systemDnsCallback = null
+        try {
+            (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
+                .unregisterNetworkCallback(callback)
+        } catch (e: Exception) {
+            Timber.w(e, "Unable to unregister DNS network callback")
+        }
+    }
+
+    private fun queueSystemDnsRefresh() {
+        serviceScope.launch { refreshSystemDns() }
+    }
+
+    @Synchronized
+    private fun refreshSystemDns() {
+        if (!systemDnsEnabled || _state.value != VpnState.RUNNING) return
+        val servers = SystemDnsServers.current(this)
+        if (servers == activeSystemDnsServers) return
+        activeSystemDnsServers = servers
+        if (servers.isEmpty()) {
+            // Never hold a DNS redirect when Android has no usable upstream.
+            IptablesManager.teardownRules(this)
+            return
+        }
+        goTunnelAdapter.configureDns("PLAIN", servers.first(), servers.drop(1).firstOrNull() ?: "", "")
+        if (!IptablesManager.isActive()) {
+            IptablesManager.setupRules(this, whitelistUids = whitelistedUids)
         }
     }
 
@@ -410,6 +488,7 @@ class RootProxyService : Service() {
             while (isActive && _state.value == VpnState.RUNNING) {
                 delay(10_000)
                 if (_state.value != VpnState.RUNNING) break
+                if (systemDnsEnabled) refreshSystemDns()
                 val dnsListenerHealthy = try {
                     Socket().use { it.connect(InetSocketAddress("127.0.0.1", 15353), 500) }
                     true
@@ -421,9 +500,14 @@ class RootProxyService : Service() {
                     serviceScope.launch(Dispatchers.Main) { restartProxy() }
                     break
                 }
-                if (!IptablesManager.isActive()) {
-                    Timber.w("iptables rules disappeared — re-applying")
-                    IptablesManager.setupRules(this@RootProxyService, whitelistUids = whitelistedUids)
+                synchronized(this@RootProxyService) {
+                    if (_state.value == VpnState.RUNNING &&
+                        (!systemDnsEnabled || activeSystemDnsServers.isNotEmpty()) &&
+                        !IptablesManager.isActive()
+                    ) {
+                        Timber.w("iptables rules disappeared — re-applying")
+                        IptablesManager.setupRules(this@RootProxyService, whitelistUids = whitelistedUids)
+                    }
                 }
             }
         }
@@ -434,9 +518,10 @@ class RootProxyService : Service() {
         _state.value = VpnState.STOPPED
         startTimestamp = 0L
         watchdogJob?.cancel()
+        unregisterSystemDnsCallback()
         stopNotificationUpdates()
         if (::appNameResolver.isInitialized) appNameResolver.stopSnapshotter()
-        IptablesManager.teardownRules(this)
+        synchronized(this) { IptablesManager.teardownRules(this) }
         serviceScope.cancel()
         super.onDestroy()
     }

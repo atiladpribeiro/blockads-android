@@ -27,6 +27,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.pwhs.blockads.R
 import app.pwhs.blockads.data.entities.DnsProvider
+import app.pwhs.blockads.data.entities.DnsProviders
 import app.pwhs.blockads.ui.settings.component.SettingsCard
 
 @Composable
@@ -57,7 +58,9 @@ fun DnsProviderGroupCard(
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                text = provider.name,
+                                text = if (provider.id == DnsProviders.SYSTEM.id) {
+                                    stringResource(R.string.dns_provider_system_default)
+                                } else provider.name,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
                                 color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
@@ -85,17 +88,21 @@ fun DnsProviderGroupCard(
                         }
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = provider.description,
+                            text = if (provider.id == DnsProviders.SYSTEM.id) {
+                                stringResource(R.string.dns_provider_system_description)
+                            } else provider.description,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = provider.ipAddress,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary,
-                            fontWeight = FontWeight.Medium
-                        )
+                        if (provider.id != DnsProviders.SYSTEM.id) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = provider.ipAddress,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
                     }
                     if (isSelected) {
                         Spacer(modifier = Modifier.width(12.dp))
