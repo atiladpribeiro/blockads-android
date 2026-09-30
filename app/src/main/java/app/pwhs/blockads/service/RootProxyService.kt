@@ -44,7 +44,8 @@ import timber.log.Timber
  * - onCreate: Initialize Go engine + Koin dependencies
  * - onStartCommand(ACTION_START): Apply iptables rules + start watchdog
  * - onStartCommand(ACTION_STOP): Teardown iptables + stop engine
- * - onDestroy / onTaskRemoved: Teardown iptables (failsafe)
+ * - onTaskRemoved: Keep the foreground service running
+ * - onDestroy: Teardown iptables (failsafe)
  */
 class RootProxyService : Service() {
 

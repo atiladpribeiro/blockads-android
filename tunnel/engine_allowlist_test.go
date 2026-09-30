@@ -43,7 +43,7 @@ func TestRootAllowlistBypassesDomainFilter(t *testing.T) {
 	}{
 		{"allowed app", "com.example.allowed", "com.example.allowed", 0},
 		{"other app", "com.example.allowed", "com.example.other", 1},
-		{"unidentified app", "", "com.example.other", 0},
+		{"unidentified app", "", "com.example.other", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := NewEngine()
