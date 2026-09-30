@@ -114,7 +114,7 @@ class VpnTunnelBuilder(
             try {
                 builder.addDisallowedApplication(vpnService.packageName)
             } catch (e: Exception) {
-                Timber.w(e, "Could not exclude self from VPN")
+                throw IllegalStateException("Could not exclude own app from VPN", e)
             }
 
             for (appPackage in whitelistedApps) {
@@ -122,7 +122,16 @@ class VpnTunnelBuilder(
                     builder.addDisallowedApplication(appPackage)
                     Timber.d("Excluded from VPN: $appPackage")
                 } catch (e: Exception) {
-                    Timber.w(e, "Could not exclude $appPackage from VPN")
+                    val installed = try {
+                        vpnService.packageManager.getApplicationInfo(appPackage, 0)
+                        true
+                    } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
+                        false
+                    }
+                    if (installed) {
+                        throw IllegalStateException("Could not exclude allowed app $appPackage from VPN", e)
+                    }
+                    Timber.i("Allowed app is not installed: $appPackage")
                 }
             }
 
