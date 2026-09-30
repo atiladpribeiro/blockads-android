@@ -102,6 +102,19 @@ func (e *Engine) serveDNS(w dns.ResponseWriter, r *dns.Msg, appOverride string) 
 		}
 	}
 
+	// When the owning app cannot be identified, fail open rather than apply
+	// a device-wide block to an app that may have been excluded.
+	if appName == "RootProxy" {
+		e.standaloneForward(w, r, appName, startTime)
+		return
+	}
+	if allowed := e.allowedApps.Load(); allowed != nil {
+		if _, ok := (*allowed)[appName]; ok {
+			e.standaloneForward(w, r, appName, startTime)
+			return
+		}
+	}
+
 	// DoH Bypass Protection (Issue #145): block DoH bootstrap queries so clients fall back to plaintext DNS
 	if e.isDoHDomain(domain) {
 		e.standaloneBlock(w, r, "doh_bypass_protection", appName, startTime)

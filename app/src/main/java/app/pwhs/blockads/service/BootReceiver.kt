@@ -37,7 +37,14 @@ class BootReceiver : BroadcastReceiver() {
                     Triple(prefs.autoReconnect.first(), prefs.vpnEnabled.first(), prefs.routingMode.first())
                 }
 
-                if (autoReconnect && wasEnabled) {
+                // Root mode treats auto reconnect as the boot-start preference.
+                // Its filter database lives in credential-encrypted storage, so
+                // wait for BOOT_COMPLETED after unlock instead of starting at
+                // LOCKED_BOOT_COMPLETED. VPN mode keeps its previous semantics.
+                val shouldStart = shouldAutoStartAfterBoot(
+                    autoReconnect, wasEnabled, routingMode, isLocked
+                )
+                if (shouldStart) {
                     val trigger = when (intentAction) {
                         Intent.ACTION_MY_PACKAGE_REPLACED -> "app update"
                         Intent.ACTION_LOCKED_BOOT_COMPLETED -> "locked direct boot"
@@ -75,3 +82,11 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
 }
+
+internal fun shouldAutoStartAfterBoot(
+    autoReconnect: Boolean,
+    wasEnabled: Boolean,
+    routingMode: String,
+    isLocked: Boolean
+): Boolean = autoReconnect &&
+    if (routingMode == AppPreferences.ROUTING_MODE_ROOT) !isLocked else wasEnabled

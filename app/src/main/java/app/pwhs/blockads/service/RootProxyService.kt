@@ -24,6 +24,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import java.util.Locale
+import java.net.InetSocketAddress
+import java.net.Socket
 import app.pwhs.blockads.utils.startOfDayMillis
 import app.pwhs.blockads.worker.RootProxyResumeWorker
 import kotlinx.coroutines.cancel
@@ -99,6 +101,7 @@ class RootProxyService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var startupJob: Job? = null
     private var watchdogJob: Job? = null
     private var notificationUpdateJob: Job? = null
     private var retryManager = VpnRetryManager(maxRetries = 10, maxDelayMs = 60000L)
@@ -195,7 +198,7 @@ class RootProxyService : Service() {
             maxDelayMs = 60000L
         )
 
-        serviceScope.launch {
+        startupJob = serviceScope.launch {
             try {
                 // 1. Load filters (same as VPN mode)
                 filterRepo.loadWhitelist()
@@ -241,11 +244,13 @@ class RootProxyService : Service() {
                         null
                     }
                 }.distinct()
+                goTunnelAdapter.setAllowedApps(appPrefs.getWhitelistedAppsSnapshot())
 
                 // 3. Retry loop for Standalone mode and IPTables setup
                 // This is crucial on boot where Magisk `su` might take a few seconds to become available
                 var proxyStarted = false
-                while (!proxyStarted && retryManager.shouldRetry()) {
+                while (isActive && _state.value == VpnState.STARTING &&
+                    !proxyStarted && retryManager.shouldRetry()) {
                     // Recreate the libsu shell if a non-root one got cached
                     // (happens when the first shell command ran before the
                     // su daemon was ready — see #179). Without this, every
@@ -270,9 +275,10 @@ class RootProxyService : Service() {
                     }
                 }
 
+                if (!isActive || _state.value != VpnState.STARTING) return@launch
                 if (!proxyStarted) {
                     Timber.e("Failed to start Root Proxy after ${retryManager.getMaxRetries()} attempts")
-                    stopProxy()
+                    stopProxy(fromStartupFailure = true)
                     showStartFailedNotification()
                     return@launch
                 }
@@ -300,31 +306,35 @@ class RootProxyService : Service() {
 
                 // 4. Start watchdog
                 startWatchdog()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Timber.e(e, "Failed to start Root Proxy mode")
-                IptablesManager.teardownRules()
-                stopSelf()
+                stopProxy(fromStartupFailure = true)
+                showStartFailedNotification()
             }
         }
     }
 
-    private fun stopProxy(showPausedNotification: Boolean = false) {
+    private fun stopProxy(
+        showPausedNotification: Boolean = false,
+        fromStartupFailure: Boolean = false
+    ) {
         Timber.d("Stopping Root Proxy mode")
         _state.value = VpnState.STOPPING
+        if (!fromStartupFailure) startupJob?.cancel()
+        startupJob = null
         watchdogJob?.cancel()
         stopNotificationUpdates()
         appNameResolver.stopSnapshotter()
 
         // Teardown iptables rules (critical — prevents internet loss)
-        IptablesManager.teardownRules()
+        IptablesManager.teardownRules(this)
 
         // Stop Go engine
         goTunnelAdapter.stop()
 
         _state.value = VpnState.STOPPED
-        serviceScope.launch {
-            appPrefs.setVpnEnabled(false)
-        }
         startTimestamp = 0L
         if (showPausedNotification) {
             stopForeground(STOP_FOREGROUND_DETACH)
@@ -332,7 +342,10 @@ class RootProxyService : Service() {
         } else {
             stopForeground(STOP_FOREGROUND_REMOVE)
         }
-        stopSelf()
+        serviceScope.launch {
+            appPrefs.setVpnEnabled(false)
+            stopSelf()
+        }
     }
 
     private fun pauseProxy() {
@@ -362,6 +375,8 @@ class RootProxyService : Service() {
         if (s != VpnState.RUNNING && s != VpnState.STARTING) return
 
         _state.value = VpnState.RESTARTING
+        startupJob?.cancel()
+        startupJob = null
         Timber.d("Restarting Root Proxy to apply new settings")
 
         watchdogJob?.cancel()
@@ -373,7 +388,7 @@ class RootProxyService : Service() {
             goTunnelAdapter.stop()
 
             // Teardown iptables
-            IptablesManager.teardownRules()
+            IptablesManager.teardownRules(this@RootProxyService)
 
             // Brief delay to let resources clean up
             delay(1000L)
@@ -386,24 +401,25 @@ class RootProxyService : Service() {
     }
 
     /**
-     * Watchdog monitors Go engine health every 10 seconds.
-     * If the engine is dead, teardown iptables to prevent internet loss.
+     * Watchdog monitors the local DNS listener and redirect every 10 seconds.
      */
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = serviceScope.launch {
             while (isActive && _state.value == VpnState.RUNNING) {
                 delay(10_000)
-                // TODO: Check Go engine health
-                // if (!goEngine.isRunning()) {
-                //     Timber.w("Go engine died — tearing down iptables")
-                //     IptablesManager.teardownRules()
-                //     isRunning = false
-                //     stopSelf()
-                //     break
-                // }
-
-                // For now, check if iptables rules are still active
+                if (_state.value != VpnState.RUNNING) break
+                val dnsListenerHealthy = try {
+                    Socket().use { it.connect(InetSocketAddress("127.0.0.1", 15353), 500) }
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+                if (!dnsListenerHealthy) {
+                    Timber.e("Local DNS listener stopped; restarting protection")
+                    serviceScope.launch(Dispatchers.Main) { restartProxy() }
+                    break
+                }
                 if (!IptablesManager.isActive()) {
                     Timber.w("iptables rules disappeared — re-applying")
                     IptablesManager.setupRules(this@RootProxyService, whitelistUids = whitelistedUids)
@@ -419,14 +435,15 @@ class RootProxyService : Service() {
         watchdogJob?.cancel()
         stopNotificationUpdates()
         if (::appNameResolver.isInitialized) appNameResolver.stopSnapshotter()
-        IptablesManager.teardownRules()
+        IptablesManager.teardownRules(this)
         serviceScope.cancel()
         super.onDestroy()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Timber.d("RootProxyService onTaskRemoved — teardown iptables")
-        IptablesManager.teardownRules()
+        // Dismissing the activity does not stop a foreground protection service.
+        // The old teardown raced with the watchdog and left the UI unprotected.
+        Timber.d("RootProxyService task removed; protection remains active")
         super.onTaskRemoved(rootIntent)
     }
 

@@ -14,14 +14,19 @@ import timber.log.Timber
  *
  * Architecture:
  * - nat table:    REDIRECT port 53 → 15353 (DNS interception)
- * - filter table: DROP port 853 (block DoT to force plain DNS)
- * - settings:     Disable Android Private DNS (forces port 53 fallback)
+ * - filter table: optional DROP port 853
+ * - settings: temporarily disable Android Private DNS and restore its prior mode
  */
 object IptablesManager {
 
     private const val CHAIN = "BLOCKADS_DNS"
     private const val CHAIN_FILTER = "BLOCKADS_DOT"
     private const val LOCAL_DNS_PORT = 15353
+    private const val DNS_PREFS = "root_proxy_dns_state"
+    private const val PREVIOUS_DNS_MODE = "previous_private_dns_mode"
+
+    private fun savedDnsMode(context: Context) =
+        context.getSharedPreferences(DNS_PREFS, Context.MODE_PRIVATE)
 
     /**
      * Ensure the cached libsu main shell actually has root.
@@ -55,9 +60,7 @@ object IptablesManager {
      * permission prompt if it hasn't been granted yet.
      */
     fun isRootAvailable(): Boolean {
-        // Explicitly trigger 'su' so Magisk/KernelSU shows the permission prompt
-        val result = Shell.cmd("su -c id").exec()
-        return result.isSuccess && result.out.any { it.contains("uid=0") }
+        return ensureRootShell()
     }
 
     /**
@@ -70,24 +73,47 @@ object IptablesManager {
      *        addDisallowedApplication (#150)
      * @return true if at least IPv4 rules succeeded
      */
+    @Synchronized
     fun setupRules(
         context: Context,
-        blockDoT: Boolean = true,
+        blockDoT: Boolean = false,
         whitelistUids: Collection<Int> = emptyList()
     ): Boolean {
         val uid = context.applicationInfo.uid
         Timber.d("Setting up iptables rules for UID=$uid, blockDoT=$blockDoT, whitelistUids=$whitelistUids")
 
         // Always teardown first (idempotent)
-        teardownRules()
+        teardownRules(context)
+        if (isActive()) {
+            Timber.e("Old DNS redirect is still active; refusing to stack rules")
+            return false
+        }
 
         // ══════════════════════════════════════════════════════════════
         // Step 0: Disable Android Private DNS so system uses port 53
         // This is CRITICAL — without this, Android 9+ uses DoT (853)
         // and our port 53 redirect never sees traffic.
         // ══════════════════════════════════════════════════════════════
-        Shell.cmd("settings put global private_dns_mode off").exec()
-        Timber.d("Disabled Android Private DNS (forced plain DNS mode)")
+        val currentMode = Shell.cmd("settings get global private_dns_mode").exec()
+            .out.firstOrNull()?.trim().orEmpty()
+        if (currentMode !in setOf("off", "opportunistic", "hostname")) {
+            Timber.e("Unknown Private DNS mode; refusing to change global DNS setting")
+            return false
+        }
+        if (currentMode != "off") {
+            // Store the exact user setting before changing global DNS. A restart
+            // can then restore it even when the service process has died.
+            val saved = savedDnsMode(context)
+            if (!saved.edit().putString(PREVIOUS_DNS_MODE, currentMode).commit()) {
+                Timber.e("Cannot preserve Private DNS setting; refusing root DNS setup")
+                return false
+            }
+            if (!Shell.cmd("settings put global private_dns_mode off").exec().isSuccess) {
+                saved.edit().remove(PREVIOUS_DNS_MODE).commit()
+                Timber.e("Cannot disable Private DNS for root DNS interception")
+                return false
+            }
+        }
 
         // ══════════════════════════════════════════════════════════════
         // Step 1: nat table — REDIRECT port 53 → local engine
@@ -178,37 +204,55 @@ object IptablesManager {
             Timber.e("iptables rules NOT active after setup — root may have been denied")
         }
 
-        return ipv4Success && verified
+        if (!ipv4Success || !verified) {
+            // Never leave a partially installed redirect after startup fails.
+            teardownRules(context)
+            return false
+        }
+        return true
     }
 
     /**
      * Remove all BlockAds iptables rules and restore Private DNS.
      * Safe to call multiple times. Uses 2>/dev/null to suppress errors.
      */
-    fun teardownRules(): Boolean {
+    @Synchronized
+    fun teardownRules(context: Context): Boolean {
         val commands = listOf(
             // IPv4 nat chain
-            "iptables -t nat -D OUTPUT -j $CHAIN 2>/dev/null",
+            "while iptables -t nat -C OUTPUT -j $CHAIN 2>/dev/null; do iptables -t nat -D OUTPUT -j $CHAIN 2>/dev/null || break; done",
             "iptables -t nat -F $CHAIN 2>/dev/null",
             "iptables -t nat -X $CHAIN 2>/dev/null",
             // IPv4 filter chain (DoT blocking)
-            "iptables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null",
+            "while iptables -t filter -C OUTPUT -j $CHAIN_FILTER 2>/dev/null; do iptables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null || break; done",
             "iptables -t filter -F $CHAIN_FILTER 2>/dev/null",
             "iptables -t filter -X $CHAIN_FILTER 2>/dev/null",
             // IPv6 nat chain
-            "ip6tables -t nat -D OUTPUT -j $CHAIN 2>/dev/null",
+            "while ip6tables -t nat -C OUTPUT -j $CHAIN 2>/dev/null; do ip6tables -t nat -D OUTPUT -j $CHAIN 2>/dev/null || break; done",
             "ip6tables -t nat -F $CHAIN 2>/dev/null",
             "ip6tables -t nat -X $CHAIN 2>/dev/null",
             // IPv6 filter chain (DoT blocking)
-            "ip6tables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null",
+            "while ip6tables -t filter -C OUTPUT -j $CHAIN_FILTER 2>/dev/null; do ip6tables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null || break; done",
             "ip6tables -t filter -F $CHAIN_FILTER 2>/dev/null",
             "ip6tables -t filter -X $CHAIN_FILTER 2>/dev/null",
-            // Restore Android Private DNS to automatic mode
-            "settings put global private_dns_mode opportunistic",
         )
 
         Shell.cmd(*commands.toTypedArray()).exec()
-        Timber.d("iptables teardown done, Private DNS restored")
+        val saved = savedDnsMode(context)
+        val previousMode = saved.getString(PREVIOUS_DNS_MODE, null)
+        if (previousMode != null) {
+            val currentMode = Shell.cmd("settings get global private_dns_mode").exec()
+                .out.firstOrNull()?.trim()
+            // Respect a setting changed by the user while protection was active.
+            if (currentMode != "off" || previousMode !in setOf("opportunistic", "hostname") ||
+                Shell.cmd("settings put global private_dns_mode $previousMode").exec().isSuccess
+            ) {
+                saved.edit().remove(PREVIOUS_DNS_MODE).commit()
+            } else {
+                Timber.e("Failed to restore Private DNS mode; will retry on teardown")
+            }
+        }
+        Timber.d("iptables teardown done")
         return true
     }
 
