@@ -97,12 +97,8 @@ func (r *Resolver) Configure(protocol DNSProtocol, primary, fallback, dohURL str
 	defer r.mu.Unlock()
 
 	r.protocol = protocol
-	if primary != "" {
-		r.primaryServer = primary
-	}
-	if fallback != "" {
-		r.fallbackServer = fallback
-	}
+	r.primaryServer = primary
+	r.fallbackServer = fallback
 	r.dohURL = dohURL
 
 	if protocol != ProtocolDoQ {

@@ -102,6 +102,17 @@ func (e *Engine) serveDNS(w dns.ResponseWriter, r *dns.Msg, appOverride string) 
 		}
 	}
 
+	// The iptables owner rules bypass opted-out app UIDs before their queries
+	// reach this listener. Attribution is best-effort on Android, so an
+	// unidentified query must still use the normal filter pipeline; otherwise
+	// short-lived DNS sockets silently disable blocking for the whole device.
+	if allowed := e.allowedApps.Load(); allowed != nil {
+		if _, ok := (*allowed)[appName]; ok {
+			e.standaloneForward(w, r, appName, startTime)
+			return
+		}
+	}
+
 	// DoH Bypass Protection (Issue #145): block DoH bootstrap queries so clients fall back to plaintext DNS
 	if e.isDoHDomain(domain) {
 		e.standaloneBlock(w, r, "doh_bypass_protection", appName, startTime)

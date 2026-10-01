@@ -158,9 +158,12 @@ func (cm *CertManager) initCA(certDir string) error {
 		if err := cm.loadCA(certPath, keyPath); err == nil {
 			logf("MITM CA loaded from disk: %s", certDir)
 			return nil
+		} else {
+			return fmt.Errorf("existing MITM CA is invalid; refusing to replace a trusted CA: %w", err)
 		}
-		// If loading fails (corrupt file, etc.), fall through and regenerate.
-		logf("MITM CA: failed to load from disk, regenerating...")
+	}
+	if fileExists(certPath) || fileExists(keyPath) {
+		return fmt.Errorf("incomplete MITM CA pair; refusing to replace a trusted CA")
 	}
 
 	// ── Generate a new CA and write it to disk ─────────────────────
@@ -168,12 +171,9 @@ func (cm *CertManager) initCA(certDir string) error {
 		return err
 	}
 	if err := cm.saveCA(certPath, keyPath); err != nil {
-		// Non-fatal: the proxy can still work with the in-memory CA,
-		// but the next restart will generate a new one.
-		logf("MITM CA: WARNING — failed to save to disk: %v", err)
-	} else {
-		logf("MITM CA: generated and saved to %s", certDir)
+		return fmt.Errorf("persist MITM CA: %w", err)
 	}
+	logf("MITM CA: generated and saved to %s", certDir)
 	return nil
 }
 
@@ -248,13 +248,14 @@ func (cm *CertManager) saveCA(certPath, keyPath string) error {
 	keyPEM := cm.caKeyPEM
 	cm.mu.RUnlock()
 
-	// Write cert (world-readable is fine — it's a public certificate)
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return fmt.Errorf("write CA cert: %w", err)
-	}
 	// Write key (owner-only — private key must stay secret)
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
 		return fmt.Errorf("write CA key: %w", err)
+	}
+	// Publish the public certificate only after its private key is persisted.
+	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+		_ = os.Remove(keyPath)
+		return fmt.Errorf("write CA cert: %w", err)
 	}
 	return nil
 }
@@ -277,8 +278,8 @@ func (cm *CertManager) generateCA() error {
 	caTemplate := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			Organization: []string{"BlockAds"},
-			CommonName:   "BlockAds Root CA",
+			Organization: []string{"Local Device"},
+			CommonName:   "Local Filtering CA",
 		},
 		NotBefore:             time.Now().Add(-24 * time.Hour), // 1 day grace
 		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years

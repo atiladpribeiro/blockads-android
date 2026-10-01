@@ -126,6 +126,7 @@ type Engine struct {
 	// to pay when the user isn't recording logs at all. Checked before any
 	// resolution work; see logConnection.
 	connLogEnabled atomic.Bool
+	allowedApps    atomic.Pointer[map[string]struct{}]
 
 	// quicDrop: when true, browser QUIC (UDP 443) is dropped to force
 	// HTTP/3 traffic onto TCP TLS where the MITM can filter it. This gives
@@ -201,6 +202,18 @@ func (e *Engine) SetOutboundAdapter(adapter OutboundAdapter) {
 // This is called before Start() to provide the blocking logic for rules not in the trie (like Custom Rules).
 func (e *Engine) SetDomainChecker(checker DomainChecker) {
 	e.domainChecker = checker
+}
+
+// SetAllowedApps bypasses root-mode DNS filtering for identified packages.
+func (e *Engine) SetAllowedApps(packagesCSV string) {
+	packages := make(map[string]struct{})
+	for _, pkg := range strings.Split(packagesCSV, ",") {
+		pkg = strings.TrimSpace(pkg)
+		if pkg != "" {
+			packages[pkg] = struct{}{}
+		}
+	}
+	e.allowedApps.Store(&packages)
 }
 
 // SetTries loads the native memory-mapped domain tries and bloom filters for blazing-fast lookups in Go.

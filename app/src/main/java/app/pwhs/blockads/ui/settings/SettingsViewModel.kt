@@ -115,6 +115,9 @@ class SettingsViewModel(
             AppPreferences.DEFAULT_UPSTREAM_DNS
         )
 
+    val dnsProviderId: StateFlow<String?> = appPrefs.dnsProviderId
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
     val networkSwitchDelayEnabled: StateFlow<Boolean> = appPrefs.networkSwitchDelayEnabled
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 

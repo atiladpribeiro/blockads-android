@@ -48,6 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.pwhs.blockads.R
+import app.pwhs.blockads.data.datastore.AppPreferences
 import app.pwhs.blockads.ui.theme.TextSecondary
 import app.pwhs.blockads.ui.whitelist.component.AppListItem
 import kotlinx.coroutines.launch
@@ -61,6 +62,7 @@ fun AppWhitelistScreen(
     onNavigateBack: () -> Unit = { }
 ) {
     val whitelistedApps by viewModel.whitelistedApps.collectAsStateWithLifecycle()
+    val routingMode by viewModel.routingMode.collectAsStateWithLifecycle()
     val installedApps by viewModel.installedApps.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     var searchQuery by remember { mutableStateOf("") }
@@ -126,6 +128,14 @@ fun AppWhitelistScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            if (routingMode == AppPreferences.ROUTING_MODE_ROOT && whitelistedApps.isNotEmpty()) {
+                Text(
+                    text = stringResource(R.string.whitelist_root_shared_dns_notice),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
+            }
             // Search bar
             TextField(
                 value = searchQuery,

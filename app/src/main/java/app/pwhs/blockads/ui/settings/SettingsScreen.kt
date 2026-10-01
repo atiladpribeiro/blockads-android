@@ -77,6 +77,7 @@ fun SettingsScreen(
     val dailySummaryEnabled by viewModel.dailySummaryEnabled.collectAsStateWithLifecycle()
     val milestoneNotificationsEnabled by viewModel.milestoneNotificationsEnabled.collectAsStateWithLifecycle()
     val upstreamDNS by viewModel.upstreamDns.collectAsStateWithLifecycle()
+    val dnsProviderId by viewModel.dnsProviderId.collectAsStateWithLifecycle()
 
     var showDnsResponseTypeDialog by remember { mutableStateOf(false) }
     var showClearConfirm by remember { mutableStateOf(false) }
@@ -123,7 +124,9 @@ fun SettingsScreen(
                 safeSearchEnabled = safeSearchEnabled,
                 youtubeRestrictedMode = youtubeRestrictedMode,
                 dnsResponseType = dnsResponseType,
-                upstreamDNS = upstreamDNS,
+                upstreamDNS = if (dnsProviderId == "system") {
+                    stringResource(R.string.dns_provider_system_default)
+                } else upstreamDNS,
                 onSetAutoReconnect = { viewModel.setAutoReconnect(it) },
                 onSetRoutingMode = { viewModel.setRoutingModeEnabled(it) },
                 onSetNetworkSwitchDelayEnabled = { viewModel.setNetworkSwitchDelayEnabled(it) },

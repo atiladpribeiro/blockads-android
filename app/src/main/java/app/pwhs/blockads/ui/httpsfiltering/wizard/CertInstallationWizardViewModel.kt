@@ -184,6 +184,12 @@ class CertInstallationWizardViewModel(
 
     private fun installRootModule() {
         viewModelScope.launch {
+            if (appPrefs.getRoutingModeSnapshot() == AppPreferences.ROUTING_MODE_ROOT) {
+                _uiEffect.emit(CertInstallationWizardUiEffect.ShowSnackbar(
+                    "No modo root, o módulo não ativa HTTPS e não deve ampliar a confiança do aparelho."
+                ))
+                return@launch
+            }
             _uiState.update { it.copy(isExecutingRoot = true) }
             val certDir = getApplication<Application>().filesDir.absolutePath
             var pem = engine.getMitmCACert(certDir)
@@ -191,13 +197,15 @@ class CertInstallationWizardViewModel(
                 pem = withContext(Dispatchers.IO) { engine.startStackMitm(certDir) }
             }
             val result = withContext(Dispatchers.IO) {
-                SystemCertificateInstaller.installToSystemStore(pem ?: "")
+                SystemCertificateInstaller.installToSystemStore(
+                    pem ?: "", getApplication<Application>().cacheDir
+                )
             }
             _uiState.update { it.copy(isExecutingRoot = false) }
 
             if (result.isSuccess) {
-                _uiState.update { it.copy(certStatus = CertStatus.INSTALLED, isCertExported = true) }
-                _uiEffect.emit(CertInstallationWizardUiEffect.ShowSnackbar("Đã tạo Magisk Module! Khởi động lại máy để kích hoạt đầy đủ."))
+                _uiState.update { it.copy(certStatus = CertStatus.NOT_INSTALLED) }
+                _uiEffect.emit(CertInstallationWizardUiEffect.ShowSnackbar("Módulo KernelSU preparado. Reinicie e verifique o certificado de sistema."))
                 verifyCert()
             } else {
                 _uiEffect.emit(CertInstallationWizardUiEffect.ShowSnackbar("Module install failed: ${result.exceptionOrNull()?.message}"))

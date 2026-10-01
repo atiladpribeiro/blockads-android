@@ -4,6 +4,7 @@
     <string name="whitelist_apps_search">Pesquisar aplicativos…</string>
     <string name="whitelist_apps_empty">Nenhum aplicativo instalado</string>
     <string name="whitelist_apps_count">%d aplicativos permitidos</string>
+    <string name="whitelist_root_shared_dns_notice">No modo root, o DNS compartilhado do Android passa sem filtragem enquanto há aplicativos liberados. O DNS direto dos demais aplicativos ainda pode ser filtrado.</string>
     <string name="whitelist_tab_user">Aplicativos do usuário</string>
     <string name="whitelist_tab_system">Aplicativos do sistema</string>
     <string name="about_title">Sobre</string>
@@ -97,6 +98,8 @@
     <string name="settings_auto_update_notification_silent">Silencioso</string>
     <string name="settings_auto_update_notification_none">Nenhuma</string>
     <string name="dns_provider_title">Servidor DNS</string>
+    <string name="dns_provider_system_default">Padrão do sistema</string>
+    <string name="dns_provider_system_description">Usar os servidores DNS fornecidos pela rede atual</string>
     <string name="dns_category_standard">Padrão</string>
     <string name="dns_category_privacy">Foco em privacidade</string>
     <string name="dns_category_family">Seguro para família</string>

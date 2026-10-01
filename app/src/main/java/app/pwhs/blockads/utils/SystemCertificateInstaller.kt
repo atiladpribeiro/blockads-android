@@ -7,22 +7,21 @@ import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Locale
+import java.io.File
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
- * Utility to install BlockAds Root CA directly into the Android System CA Store
- * on rooted devices (Magisk, KernelSU, APatch).
- *
- * This provides system-wide HTTPS filtering for all applications without triggering
- * user-certificate warnings or broken SSL errors.
+ * Installs only the public CA certificate. TLS interception is separately
+ * controlled by the VPN engine and never enabled by installing this module.
  */
 object SystemCertificateInstaller {
 
     private const val MODULE_ID = "blockads_ca"
-    private const val MODULE_DIR = "/data/adb/modules/$MODULE_ID"
 
     fun isRootAvailable(): Boolean {
         return try {
-            Shell.isAppGrantedRoot() == true || Shell.cmd("id").exec().isSuccess
+            Shell.isAppGrantedRoot() == true && Shell.cmd("id -u").exec().out.firstOrNull()?.trim() == "0"
         } catch (e: Exception) {
             Timber.w(e, "Failed to check root availability")
             false
@@ -101,98 +100,55 @@ object SystemCertificateInstaller {
         }
     }
 
-    /**
-     * Installs the CA certificate as a Magisk / KernelSU module so it mounts
-     * automatically into /system/etc/security/cacerts/ and Conscrypt APEX.
-     */
-    fun installToSystemStore(caPem: String): Result<String> {
-        if (!isRootAvailable()) {
-            return Result.failure(IllegalStateException("Root access is not available"))
-        }
-
+    /** Stage a certificate-only KernelSU module. Reboot and verify system trust separately. */
+    fun installToSystemStore(caPem: String, cacheDir: File): Result<String> {
+        if (!isRootAvailable()) return Result.failure(IllegalStateException("Root access is not available"))
         return try {
-            val certFactory = CertificateFactory.getInstance("X.509")
-            val cert = certFactory.generateCertificate(
+            val cert = CertificateFactory.getInstance("X.509").generateCertificate(
                 ByteArrayInputStream(caPem.toByteArray())
             ) as X509Certificate
-
+            require(cert.basicConstraints >= 0) { "Certificate is not a CA" }
+            cert.checkValidity()
             val hashOld = computeSubjectHashOld(cert)
             val hashSha1 = computeSubjectHashSha1(cert)
-
-            val commands = mutableListOf<String>()
-
-            // 1. Prepare Magisk / KernelSU module structure
-            commands.add("mkdir -p $MODULE_DIR/system/etc/security/cacerts")
-            commands.add("mkdir -p $MODULE_DIR/system/apex/com.android.conscrypt/cacerts")
-
-            // 2. Write module.prop
-            val moduleProp = """
-                id=$MODULE_ID
-                name=BlockAds Root CA
-                version=1.1
-                versionCode=2
-                author=BlockAds
-                description=System CA Certificate for BlockAds HTTPS Filtering
-            """.trimIndent()
-            commands.add("cat << 'EOF' > $MODULE_DIR/module.prop\n$moduleProp\nEOF")
-
-            // 3. Write certificate files (both old MD5 and new SHA1 hashes)
-            for (hash in setOf(hashOld, hashSha1)) {
-                val certPath1 = "$MODULE_DIR/system/etc/security/cacerts/$hash.0"
-                val certPath2 = "$MODULE_DIR/system/apex/com.android.conscrypt/cacerts/$hash.0"
-                commands.add("cat << 'EOF' > $certPath1\n$caPem\nEOF")
-                commands.add("chmod 644 $certPath1")
-                commands.add("cat << 'EOF' > $certPath2\n$caPem\nEOF")
-                commands.add("chmod 644 $certPath2")
+            val canonicalPem = java.util.Base64.getMimeEncoder(64, "\n".toByteArray())
+                .encodeToString(cert.encoded)
+                .let { "-----BEGIN CERTIFICATE-----\n$it\n-----END CERTIFICATE-----\n" }
+            val zip = File(cacheDir, "blockads_ca_kernelsu.zip")
+            ZipOutputStream(zip.outputStream()).use { out ->
+                fun add(name: String, content: String) {
+                    out.putNextEntry(ZipEntry(name))
+                    out.write(content.toByteArray(Charsets.UTF_8))
+                    out.closeEntry()
+                }
+                add("module.prop", """id=$MODULE_ID
+name=BlockAds Certificate
+version=2.0
+versionCode=3
+author=BlockAds
+description=Public certificate only; requires explicit HTTPS VPN mode
+""")
+                for (hash in setOf(hashOld, hashSha1)) {
+                    add("system/etc/security/cacerts/$hash.0", canonicalPem)
+                }
             }
-
-            // 4. Also write service.sh to mount into Conscrypt APEX on boot for Android 14+
-            val serviceScript = """
-                #!/system/bin/sh
-                # Mount certificate into Conscrypt APEX on Android 14+
-                APEX_DIR="/apex/com.android.conscrypt/cacerts"
-                if [ -d "${'$'}APEX_DIR" ]; then
-                    mount -t tmpfs tmpfs "${'$'}APEX_DIR" 2>/dev/null || true
-                    cp /system/etc/security/cacerts/* "${'$'}APEX_DIR/" 2>/dev/null || true
-                    chmod 644 "${'$'}APEX_DIR"/* 2>/dev/null || true
-                fi
-            """.trimIndent()
-            commands.add("cat << 'EOF' > $MODULE_DIR/service.sh\n$serviceScript\nEOF")
-            commands.add("chmod 755 $MODULE_DIR/service.sh")
-
-            // 5. Also install immediately to user store so it works right away without reboot!
-            val userStoreDir = "/data/misc/user/0/cacerts-added"
-            commands.add("mkdir -p $userStoreDir")
-            commands.add("cat << 'EOF' > $userStoreDir/$hashOld.0\n$caPem\nEOF")
-            commands.add("chmod 644 $userStoreDir/$hashOld.0")
-            commands.add("chown system:system $userStoreDir/$hashOld.0 2>/dev/null || true")
-
-            // 6. Live inject into Conscrypt APEX immediately so it works right away
-            commands.add("""
-                APEX_DIR="/apex/com.android.conscrypt/cacerts"
-                if [ -d "${'$'}APEX_DIR" ]; then
-                    for h in $hashOld $hashSha1; do
-                        cert="$MODULE_DIR/system/apex/com.android.conscrypt/cacerts/${'$'}h.0"
-                        if [ -f "${'$'}cert" ]; then
-                            cp "${'$'}cert" "${'$'}APEX_DIR/" 2>/dev/null || true
-                        fi
-                    done
-                    chmod 644 "${'$'}APEX_DIR"/* 2>/dev/null || true
-                fi
-            """.trimIndent())
-
-            val res = Shell.cmd(*commands.toTypedArray()).exec()
-            if (res.isSuccess) {
-                Timber.d("CA installed to system store module successfully (hashOld=$hashOld, hashSha1=$hashSha1)")
+            try {
+                val ksud = Shell.cmd("command -v ksud").exec()
+                if (!ksud.isSuccess || ksud.out.firstOrNull().isNullOrBlank()) {
+                    return Result.failure(IllegalStateException("KernelSU Next module manager is unavailable"))
+                }
+                val result = Shell.cmd("ksud module install '${zip.absolutePath}'").exec()
+                if (!result.isSuccess) {
+                    return Result.failure(IllegalStateException(result.err.joinToString("\n")))
+                }
                 Result.success(hashOld)
-            } else {
-                val err = res.err.joinToString("\n")
-                Timber.e("Failed to install CA to system store: $err")
-                Result.failure(RuntimeException(err))
+            } finally {
+                zip.delete()
             }
         } catch (e: Exception) {
-            Timber.e(e, "Exception during system CA installation")
+            Timber.e(e, "KernelSU certificate module staging failed")
             Result.failure(e)
         }
     }
+
 }

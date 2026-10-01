@@ -11,10 +11,8 @@ import app.pwhs.blockads.utils.AppNameResolver
 import app.pwhs.blockads.utils.BlocklistInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import timber.log.Timber
 import tunnel.AppResolver
 import tunnel.DomainChecker
@@ -51,6 +49,10 @@ class GoTunnelAdapter(
         dohUrl: String,
     ) {
         engine.setDNS(protocol, primary, fallback, dohUrl)
+    }
+
+    fun setAllowedApps(packages: Collection<String>) {
+        engine.setAllowedApps(packages.joinToString(","))
     }
 
     /**
@@ -381,35 +383,19 @@ class GoTunnelAdapter(
         updateCosmeticRules()
 
         Timber.d("Starting Go tunnel engine in STANDALONE mode on port $port")
-        val deferred = kotlinx.coroutines.CompletableDeferred<Boolean>()
-
-        scope.launch(Dispatchers.IO) {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
             try {
-                launch {
-                    delay(500)
-                    if (!deferred.isCompleted) {
-                        isRunning = true
-                        deferred.complete(true)
-                    }
-                }
+                // The Go method returns after its DNS listeners have bound.
+                // Report success only after that return, before installing
+                // network redirection rules.
                 engine.startStandalone(port.toLong())
+                isRunning = true
+                true
             } catch (e: Exception) {
                 Timber.e(e, "Go standalone engine crashed or failed to start")
                 isRunning = false
-                if (!deferred.isCompleted) {
-                    deferred.complete(false)
-                }
+                false
             }
-        }
-
-        return try {
-            withTimeout(2000) {
-                deferred.await()
-            }
-        } catch (e: TimeoutCancellationException) {
-            Timber.e("Timeout waiting for Go engine to start")
-            isRunning = false
-            false
         }
     }
 

@@ -83,6 +83,12 @@ class HttpsFilteringViewModel(
     /** Toggle HTTPS filtering on or off. */
     fun toggleEnabled(enabled: Boolean) {
         viewModelScope.launch {
+            if (enabled && appPrefs.getRoutingModeSnapshot() == AppPreferences.ROUTING_MODE_ROOT) {
+                _events.emit(HttpsFilteringEvent.Error(
+                    "A filtragem HTTPS requer o modo VPN. No modo root, apenas o DNS é filtrado."
+                ))
+                return@launch
+            }
             _isEnabled.value = enabled
             appPrefs.setHttpsFilteringEnabled(enabled)
 
@@ -312,6 +318,12 @@ class HttpsFilteringViewModel(
      */
     fun installToSystemStore() {
         viewModelScope.launch {
+            if (appPrefs.getRoutingModeSnapshot() == AppPreferences.ROUTING_MODE_ROOT) {
+                _events.emit(HttpsFilteringEvent.Error(
+                    "No modo root, instalar uma CA de sistema não ativa o filtro HTTPS e amplia a confiança do aparelho."
+                ))
+                return@launch
+            }
             var pem = _caCertPem.value
             if (pem.isNullOrEmpty()) {
                 val certDir = getApplication<Application>().filesDir.absolutePath
@@ -325,12 +337,13 @@ class HttpsFilteringViewModel(
                 return@launch
             }
             val result = withContext(Dispatchers.IO) {
-                app.pwhs.blockads.utils.SystemCertificateInstaller.installToSystemStore(pem)
+                app.pwhs.blockads.utils.SystemCertificateInstaller.installToSystemStore(
+                    pem, getApplication<Application>().cacheDir
+                )
             }
             if (result.isSuccess) {
-                _certStatus.value = CertStatus.INSTALLED
-                _certExported.value = true
-                _events.emit(HttpsFilteringEvent.CaCertSavedToDownloads("Magisk Module (${result.getOrNull()}.0)"))
+                _certStatus.value = CertStatus.NOT_INSTALLED
+                _events.emit(HttpsFilteringEvent.Error("Módulo KernelSU preparado. Reinicie o aparelho e verifique o certificado de sistema antes de ativar HTTPS."))
             } else {
                 _events.emit(HttpsFilteringEvent.Error("Root install failed: ${result.exceptionOrNull()?.message}"))
             }
@@ -359,18 +372,19 @@ class HttpsFilteringViewModel(
 
             // Load saved preference
             val enabled = appPrefs.getHttpsFilteringEnabledSnapshot()
-            _isEnabled.value = enabled
+            val rootMode = appPrefs.getRoutingModeSnapshot() == AppPreferences.ROUTING_MODE_ROOT
+            if (enabled && rootMode) appPrefs.setHttpsFilteringEnabled(false)
+            _isEnabled.value = enabled && !rootMode
             _filterHttp3.value = appPrefs.getFilterHttp3Snapshot()
 
             // Load installed browsers
             val detectedBrowsers = withContext(Dispatchers.IO) { detectBrowsers() }
             _browsers.value = detectedBrowsers
 
-            // Check if proxy is already running or CA cert exists on disk
+            // A saved CA does not prove the VPN interception engine is running.
             val certDir = getApplication<Application>().filesDir.absolutePath
             val caCert = engine.getMitmCACert(certDir)
             if (!caCert.isNullOrEmpty()) {
-                _isProxyRunning.value = true
                 _caCertPem.value = caCert
             }
 

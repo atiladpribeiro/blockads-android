@@ -14,14 +14,28 @@ import timber.log.Timber
  *
  * Architecture:
  * - nat table:    REDIRECT port 53 → 15353 (DNS interception)
- * - filter table: DROP port 853 (block DoT to force plain DNS)
- * - settings:     Disable Android Private DNS (forces port 53 fallback)
+ * - filter table: optional DROP port 853
+ * - settings: temporarily disable Android Private DNS only without app exclusions
  */
 object IptablesManager {
 
     private const val CHAIN = "BLOCKADS_DNS"
     private const val CHAIN_FILTER = "BLOCKADS_DOT"
     private const val LOCAL_DNS_PORT = 15353
+    private const val DNS_PREFS = "root_proxy_dns_state"
+    private const val PREVIOUS_DNS_MODE = "previous_private_dns_mode"
+    // Android's shared resolver sends DNS for multiple apps under a system UID.
+    // Those packets cannot be assigned back to the requesting app at OUTPUT.
+    // With app exclusions, passing them through is necessary to avoid filtering
+    // excluded apps through another UID. Direct app-owned DNS is still filtered.
+    private val SHARED_RESOLVER_UIDS = listOf(0, 1000, 1051)
+
+    internal fun excludedDnsUids(appUid: Int, whitelistUids: Collection<Int>): List<Int> =
+        (listOf(appUid) + whitelistUids +
+            (if (whitelistUids.isNotEmpty()) SHARED_RESOLVER_UIDS else emptyList())).distinct()
+
+    private fun savedDnsMode(context: Context) =
+        context.getSharedPreferences(DNS_PREFS, Context.MODE_PRIVATE)
 
     /**
      * Ensure the cached libsu main shell actually has root.
@@ -55,9 +69,7 @@ object IptablesManager {
      * permission prompt if it hasn't been granted yet.
      */
     fun isRootAvailable(): Boolean {
-        // Explicitly trigger 'su' so Magisk/KernelSU shows the permission prompt
-        val result = Shell.cmd("su -c id").exec()
-        return result.isSuccess && result.out.any { it.contains("uid=0") }
+        return ensureRootShell()
     }
 
     /**
@@ -65,29 +77,53 @@ object IptablesManager {
      *
      * @param context App context (used to get UID)
      * @param blockDoT If true, blocks DoT (port 853) to force DNS fallback to port 53
-     * @param whitelistUids UIDs of whitelisted apps whose DNS must bypass the
-     *        redirect entirely — the Root-mode equivalent of VPN mode's
-     *        addDisallowedApplication (#150)
+     * @param whitelistUids UIDs of excluded apps. Shared system DNS also passes
+     *        through when this is nonempty because its originating app is unknown.
      * @return true if at least IPv4 rules succeeded
      */
+    @Synchronized
     fun setupRules(
         context: Context,
-        blockDoT: Boolean = true,
+        blockDoT: Boolean = false,
         whitelistUids: Collection<Int> = emptyList()
     ): Boolean {
         val uid = context.applicationInfo.uid
-        Timber.d("Setting up iptables rules for UID=$uid, blockDoT=$blockDoT, whitelistUids=$whitelistUids")
+        val excludedUids = excludedDnsUids(uid, whitelistUids)
+        Timber.d("Setting up iptables rules for UID=$uid, blockDoT=$blockDoT, excludedUids=$excludedUids")
 
         // Always teardown first (idempotent)
-        teardownRules()
+        teardownRules(context)
+        if (isActive()) {
+            Timber.e("Old DNS redirect is still active; refusing to stack rules")
+            return false
+        }
 
         // ══════════════════════════════════════════════════════════════
-        // Step 0: Disable Android Private DNS so system uses port 53
-        // This is CRITICAL — without this, Android 9+ uses DoT (853)
-        // and our port 53 redirect never sees traffic.
+        // Step 0: With no app exclusions, disable Android Private DNS so
+        // the root DNS redirect can see the system resolver's port 53 traffic.
+        // With exclusions, shared resolver traffic must pass through anyway;
+        // preserve the user's Private DNS setting and avoid a global change.
         // ══════════════════════════════════════════════════════════════
-        Shell.cmd("settings put global private_dns_mode off").exec()
-        Timber.d("Disabled Android Private DNS (forced plain DNS mode)")
+        if (whitelistUids.isEmpty()) {
+            val currentMode = Shell.cmd("settings get global private_dns_mode").exec()
+                .out.firstOrNull()?.trim().orEmpty()
+            if (currentMode !in setOf("off", "opportunistic", "hostname")) {
+                Timber.e("Unknown Private DNS mode; refusing to change global DNS setting")
+                return false
+            }
+            if (currentMode != "off") {
+                val saved = savedDnsMode(context)
+                if (!saved.edit().putString(PREVIOUS_DNS_MODE, currentMode).commit()) {
+                    Timber.e("Cannot preserve Private DNS setting; refusing root DNS setup")
+                    return false
+                }
+                if (!Shell.cmd("settings put global private_dns_mode off").exec().isSuccess) {
+                    saved.edit().remove(PREVIOUS_DNS_MODE).commit()
+                    Timber.e("Cannot disable Private DNS for root DNS interception")
+                    return false
+                }
+            }
+        }
 
         // ══════════════════════════════════════════════════════════════
         // Step 1: nat table — REDIRECT port 53 → local engine
@@ -99,9 +135,9 @@ object IptablesManager {
             // Create chain (may fail if leftover — that's OK)
             add("iptables -t nat -N $CHAIN 2>/dev/null || true")
             // Skip our own app's traffic (prevents infinite loop)
-            add("iptables -t nat -A $CHAIN -m owner --uid-owner $uid -j RETURN")
-            // Skip whitelisted apps — their DNS goes straight upstream
-            for (wUid in whitelistUids) {
+            // System resolver DNS has no reliable originating app UID. When
+            // exclusions exist, fail open for that shared path.
+            for (wUid in excludedUids) {
                 add("iptables -t nat -A $CHAIN -m owner --uid-owner $wUid -j RETURN")
             }
             // Redirect UDP DNS → local engine
@@ -114,8 +150,7 @@ object IptablesManager {
             if (blockDoT) {
                 // filter table — DROP port 853 (DoT)
                 add("iptables -t filter -N $CHAIN_FILTER 2>/dev/null || true")
-                add("iptables -t filter -A $CHAIN_FILTER -m owner --uid-owner $uid -j RETURN")
-                for (wUid in whitelistUids) {
+                for (wUid in excludedUids) {
                     add("iptables -t filter -A $CHAIN_FILTER -m owner --uid-owner $wUid -j RETURN")
                 }
                 add("iptables -t filter -A $CHAIN_FILTER -p tcp --dport 853 -j REJECT")
@@ -144,8 +179,7 @@ object IptablesManager {
         // ══════════════════════════════════════════════════════════════
         val ipv6Commands = buildList {
             add("ip6tables -t nat -N $CHAIN 2>/dev/null || true")
-            add("ip6tables -t nat -A $CHAIN -m owner --uid-owner $uid -j RETURN")
-            for (wUid in whitelistUids) {
+            for (wUid in excludedUids) {
                 add("ip6tables -t nat -A $CHAIN -m owner --uid-owner $wUid -j RETURN")
             }
             add("ip6tables -t nat -A $CHAIN -p udp --dport 53 -j REDIRECT --to-ports $LOCAL_DNS_PORT")
@@ -154,8 +188,7 @@ object IptablesManager {
 
             if (blockDoT) {
                 add("ip6tables -t filter -N $CHAIN_FILTER 2>/dev/null || true")
-                add("ip6tables -t filter -A $CHAIN_FILTER -m owner --uid-owner $uid -j RETURN")
-                for (wUid in whitelistUids) {
+                for (wUid in excludedUids) {
                     add("ip6tables -t filter -A $CHAIN_FILTER -m owner --uid-owner $wUid -j RETURN")
                 }
                 add("ip6tables -t filter -A $CHAIN_FILTER -p tcp --dport 853 -j REJECT")
@@ -178,37 +211,55 @@ object IptablesManager {
             Timber.e("iptables rules NOT active after setup — root may have been denied")
         }
 
-        return ipv4Success && verified
+        if (!ipv4Success || !verified) {
+            // Never leave a partially installed redirect after startup fails.
+            teardownRules(context)
+            return false
+        }
+        return true
     }
 
     /**
      * Remove all BlockAds iptables rules and restore Private DNS.
      * Safe to call multiple times. Uses 2>/dev/null to suppress errors.
      */
-    fun teardownRules(): Boolean {
+    @Synchronized
+    fun teardownRules(context: Context): Boolean {
         val commands = listOf(
             // IPv4 nat chain
-            "iptables -t nat -D OUTPUT -j $CHAIN 2>/dev/null",
+            "while iptables -t nat -C OUTPUT -j $CHAIN 2>/dev/null; do iptables -t nat -D OUTPUT -j $CHAIN 2>/dev/null || break; done",
             "iptables -t nat -F $CHAIN 2>/dev/null",
             "iptables -t nat -X $CHAIN 2>/dev/null",
             // IPv4 filter chain (DoT blocking)
-            "iptables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null",
+            "while iptables -t filter -C OUTPUT -j $CHAIN_FILTER 2>/dev/null; do iptables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null || break; done",
             "iptables -t filter -F $CHAIN_FILTER 2>/dev/null",
             "iptables -t filter -X $CHAIN_FILTER 2>/dev/null",
             // IPv6 nat chain
-            "ip6tables -t nat -D OUTPUT -j $CHAIN 2>/dev/null",
+            "while ip6tables -t nat -C OUTPUT -j $CHAIN 2>/dev/null; do ip6tables -t nat -D OUTPUT -j $CHAIN 2>/dev/null || break; done",
             "ip6tables -t nat -F $CHAIN 2>/dev/null",
             "ip6tables -t nat -X $CHAIN 2>/dev/null",
             // IPv6 filter chain (DoT blocking)
-            "ip6tables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null",
+            "while ip6tables -t filter -C OUTPUT -j $CHAIN_FILTER 2>/dev/null; do ip6tables -t filter -D OUTPUT -j $CHAIN_FILTER 2>/dev/null || break; done",
             "ip6tables -t filter -F $CHAIN_FILTER 2>/dev/null",
             "ip6tables -t filter -X $CHAIN_FILTER 2>/dev/null",
-            // Restore Android Private DNS to automatic mode
-            "settings put global private_dns_mode opportunistic",
         )
 
         Shell.cmd(*commands.toTypedArray()).exec()
-        Timber.d("iptables teardown done, Private DNS restored")
+        val saved = savedDnsMode(context)
+        val previousMode = saved.getString(PREVIOUS_DNS_MODE, null)
+        if (previousMode != null) {
+            val currentMode = Shell.cmd("settings get global private_dns_mode").exec()
+                .out.firstOrNull()?.trim()
+            // Respect a setting changed by the user while protection was active.
+            if (currentMode != "off" || previousMode !in setOf("opportunistic", "hostname") ||
+                Shell.cmd("settings put global private_dns_mode $previousMode").exec().isSuccess
+            ) {
+                saved.edit().remove(PREVIOUS_DNS_MODE).commit()
+            } else {
+                Timber.e("Failed to restore Private DNS mode; will retry on teardown")
+            }
+        }
+        Timber.d("iptables teardown done")
         return true
     }
 
