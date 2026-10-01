@@ -257,10 +257,10 @@ class RootProxyService : Service() {
                     firewallManager = null
                 }
 
-                // Resolve whitelisted apps to UIDs so iptables skips their
-                // DNS — Root-mode equivalent of VPN mode's
-                // addDisallowedApplication. Without this the whitelist had
-                // no effect at all in Root Proxy mode (#150).
+                // Skip app-owned DNS for excluded UIDs. The shared Android
+                // resolver has no originating app UID at the packet layer;
+                // IptablesManager also passes that DNS through when exclusions
+                // exist, so an excluded app cannot be filtered through netd.
                 whitelistedUids = appPrefs.getWhitelistedAppsSnapshot().mapNotNull { pkg ->
                     try {
                         packageManager.getApplicationInfo(pkg, 0).uid

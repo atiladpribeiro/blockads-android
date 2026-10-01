@@ -28,6 +28,8 @@ class AppWhitelistViewModel(
 
     val whitelistedApps: StateFlow<Set<String>> = appPrefs.whitelistedApps
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
+    val routingMode: StateFlow<String> = appPrefs.routingMode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppPreferences.ROUTING_MODE_DIRECT)
 
     private val _installedApps = MutableStateFlow<List<AppInfoData>>(emptyList())
     val installedApps: StateFlow<List<AppInfoData>> = _installedApps.asStateFlow()
